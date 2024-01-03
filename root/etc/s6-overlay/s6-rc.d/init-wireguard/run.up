@@ -126,5 +126,4 @@ if [[ ${VPN_ENABLED} == "true" ]]; then
 
 	echo "[INFO] iptables overview:"
 	iptables -S
-	set +e
 fi
