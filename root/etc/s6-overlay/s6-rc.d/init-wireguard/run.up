@@ -101,7 +101,7 @@ if [[ ${VPN_ENABLED} == "true" ]]; then
 	iptables -P INPUT DROP
 	iptables -A INPUT -i "${VPN_CONF}" -p udp -j ACCEPT
 	iptables -A INPUT -i "${VPN_CONF}" -p tcp -j ACCEPT
-	if [ ! -z "${nw_cidr}" ];
+	if [ ! -z "${nw_cidr}" ]; then
 	  iptables -A INPUT -s "${nw_cidr}" -d "${nw_cidr}" -j ACCEPT
 	fi
 	iptables -A INPUT -i "${nw_interface}" -p udp --sport "${vpn_port}" -j ACCEPT
@@ -116,7 +116,7 @@ if [[ ${VPN_ENABLED} == "true" ]]; then
 	iptables -P OUTPUT DROP
 	iptables -A OUTPUT -o "${VPN_CONF}" -p udp -j ACCEPT
 	iptables -A OUTPUT -o "${VPN_CONF}" -p tcp -j ACCEPT
-	if [ ! -z "${nw_cidr}" ];
+	if [ ! -z "${nw_cidr}" ]; then
 	  iptables -A OUTPUT -s "${nw_cidr}" -d "${nw_cidr}" -j ACCEPT
 	fi
 	iptables -A OUTPUT -o "${nw_interface}" -p udp --dport "${vpn_port}" -j ACCEPT
