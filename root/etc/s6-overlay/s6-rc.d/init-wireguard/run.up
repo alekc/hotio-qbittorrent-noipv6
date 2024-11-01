@@ -1,133 +1,398 @@
 #!/command/with-contenv bash
 # shellcheck shell=bash
 
+# shellcheck source=/dev/null
+source /etc/s6-overlay/scripts/pia-functions
+
 umask "${UMASK}"
 
+if [[ ${VPN_ENABLED} == "true" ]] && [[ ! -d "${CONFIG_DIR}/wireguard/" ]]; then
+    mkdir "${CONFIG_DIR}/wireguard"
+    find "${CONFIG_DIR}/wireguard" -maxdepth 0 \( ! -user hotio -or ! -group hotio \) -exec chown hotio:hotio {} +
+fi
+
+if [[ ${VPN_ENABLED} == "true" ]] && [[ ${VPN_PROVIDER} == "pia" ]]; then
+    if [[ ! $(find "${CONFIG_DIR}/wireguard/pia.ca.rsa.4096.crt" -mtime -1 2>/dev/null) ]]; then
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Fetching certificate..."
+        curl -fsL --retry 5 --retry-max-time 60 --max-time 10 'https://raw.githubusercontent.com/pia-foss/manual-connections/master/ca.rsa.4096.crt' -o "${CONFIG_DIR}/wireguard/pia.ca.rsa.4096.crt" || exit 1
+    fi
+    if [[ "${VPN_PIA_DIP_TOKEN}" == "no" ]]; then
+        while [[ ! $(find "${CONFIG_DIR}/wireguard/pia-regions.json" -mtime -1 2>/dev/null) ]]; do
+            echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Fetching regions data..."
+            region_data=$(curl -fsL --retry 5 --retry-max-time 60 --max-time 10 https://serverlist.piaservers.net/vpninfo/servers/v6 | head -1 | jq -re .)
+            if [[ "$(jq -re '.groups.wg[].name' <<< "${region_data}")" == "wireguard" ]]; then
+                echo "${region_data}" > "${CONFIG_DIR}/wireguard/pia-regions.json" && \
+                    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Regions data saved in [${CONFIG_DIR}/wireguard/pia-regions.json]."
+                jq -re '"Region|Name|Port Forwarding", "------|----|---------------", (.regions[] | "\(.id)|\(.name)|\(.port_forward)")' <<< "${region_data}" | awk 'NR<3{print $0;next}{print $0| "sort"}' | rs -c\| 0 3 > "${CONFIG_DIR}/wireguard/pia-regions.txt" && \
+                    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Regions list saved in [${CONFIG_DIR}/wireguard/pia-regions.txt]."
+            fi
+        done
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Reading regions data from [${CONFIG_DIR}/wireguard/pia-regions.json]."
+        region_data=$(cat "${CONFIG_DIR}/wireguard/pia-regions.json")
+        if [[ -z "${VPN_PIA_PREFERRED_REGION}" ]]; then
+            VPN_PIA_PREFERRED_REGION=$(jq --arg PF "${VPN_AUTO_PORT_FORWARD}" -re '.regions[] | if $PF=="true" then select(.port_forward==true) else . end | .id' <<< "${region_data}" | shuf | head -1)
+            echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Picking random region [${VPN_PIA_PREFERRED_REGION}]."
+        fi
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Fetching server for region [${VPN_PIA_PREFERRED_REGION}]..."
+        pia_server=$(jq --arg PF "${VPN_AUTO_PORT_FORWARD}" --arg REGION "${VPN_PIA_PREFERRED_REGION}" -re '.regions[] | if $PF=="true" then select(.port_forward==true) else . end | select(.id==$REGION) | .servers.wg[0]' <<< "${region_data}")
+        pia_server_ip=$(jq -re '.ip' <<< "${pia_server}")
+        pia_server_hostname=$(jq -re '.cn' <<< "${pia_server}")
+    else
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Fetching DIP server..."
+        dip_server_data=$(curl -fsL --request POST 'https://www.privateinternetaccess.com/api/client/v2/dedicated_ip' --header 'Content-Type: application/json' --header "Authorization: Token $(get_token)" --data-raw '{"tokens":["'"${VPN_PIA_DIP_TOKEN}"'"]}')
+        pia_server_ip=$(jq -re '.[0].ip' <<< "${dip_server_data}")
+        pia_server_hostname=$(jq -re '.[0].cn' <<< "${dip_server_data}")
+    fi
+    if [[ -z "${pia_server_hostname}" ]] || [[ "${pia_server_hostname}" == null ]] || [[ -z "${pia_server_ip}" ]] || [[ "${pia_server_ip}" == null ]]; then
+        echo "[ERR] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Something went wrong fetching a server!"
+        exit 1
+    else
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Found server [${pia_server_hostname} - ${pia_server_ip}]."
+        wg_private_key=$(wg genkey)
+        wg_public_key=$(wg pubkey <<< "${wg_private_key}")
+        if [[ "${VPN_PIA_DIP_TOKEN}" == "no" ]]; then
+            echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Fetching WireGuard config..."
+            wg_json_response=$(curl -fsL --retry 5 --retry-max-time 60 --max-time 10 -G --connect-to "${pia_server_hostname}::${pia_server_ip}:" --cacert "${CONFIG_DIR}/wireguard/pia.ca.rsa.4096.crt" --data-urlencode "pt=$(get_token)" --data-urlencode "pubkey=${wg_public_key}" "https://${pia_server_hostname}:1337/addKey")
+        else
+            echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Fetching WireGuard config using DIP token..."
+            wg_json_response=$(curl -fsL --retry 5 --retry-max-time 60 --max-time 10 -G --connect-to "${pia_server_hostname}::${pia_server_ip}:" --cacert "${CONFIG_DIR}/wireguard/pia.ca.rsa.4096.crt" --user "dedicated_ip_${VPN_PIA_DIP_TOKEN}:${pia_server_ip}" --data-urlencode "pubkey=${wg_public_key}" "https://${pia_server_hostname}:1337/addKey")
+        fi
+        if [[ $(jq -re '.status' <<< "${wg_json_response}") != "OK" ]]; then
+            echo "[ERR] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] Something went wrong fetching WireGuard config!"
+            exit 1
+        fi
+        {
+        echo "# hostname: ${pia_server_hostname}"
+        echo "# ip: ${pia_server_ip}"
+        echo "[Interface]"
+        echo "Address = $(jq -re '.peer_ip' <<< "${wg_json_response}")"
+        echo "PrivateKey = ${wg_private_key}"
+        echo "DNS = $(jq -re '.dns_servers | join(",")' <<< "${wg_json_response}")"
+        echo "[Peer]"
+        echo "PersistentKeepalive = 25"
+        echo "PublicKey = $(jq -re '.server_key' <<< "${wg_json_response}")"
+        echo "AllowedIPs = 0.0.0.0/0"
+        echo "Endpoint = ${pia_server_ip}:$(jq -re '.server_port' <<< "${wg_json_response}")"
+        } > "${CONFIG_DIR}/wireguard/${VPN_CONF}.conf"
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [PIA] WireGuard config written to [${CONFIG_DIR}/wireguard/${VPN_CONF}.conf]."
+    fi
+fi
+
 if [[ ${VPN_ENABLED} == "true" ]]; then
+    if ! capsh --print | grep -q "Current:.*cap_net_admin"; then
+        echo "[ERR] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] [--cap-add=NET_ADMIN] is not set or running with [--privileged=true]. Exiting..."
+        echo "Add: --cap-add=NET_ADMIN"
+        echo "Remove: --privileged=true"
+        exit 1
+    fi
 
-	if ip a show docker0 up > /dev/null 2>&1; then
-		echo "[ERROR] Docker network type \"host\" is not supported with VPN enabled. Exiting..."
-		exit 1
-	else
-		echo "[INFO] Docker network type is not set to \"host\"."
-	fi
+    unset rp_filter_strict
+    for file in /proc/sys/net/ipv4/conf/*; do
+        [[ "$(cat "/proc/sys/net/ipv4/conf/${file##*/}/rp_filter")" != "0" ]] && rp_filter_strict="true"
+    done
+    if [[ "${rp_filter_strict}" == "true" ]] && [[ "$(cat /proc/sys/net/ipv4/conf/all/src_valid_mark)" != "1" ]]; then
+        echo "[ERR] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] [--sysctl=\"net.ipv4.conf.all.src_valid_mark=1\"] is not set and [rp_filter] is set to [strict]. Exiting..."
+        echo "Add: --sysctl=\"net.ipv4.conf.all.src_valid_mark=1\""
+        exit 1
+    fi
+    sed -i "s:.*sysctl -q net.ipv4.conf.all.src_valid_mark=1.*::" /usr/bin/wg-quick
 
-	if [[ "$(cat /proc/sys/net/ipv4/conf/all/src_valid_mark)" != "1" ]]; then
-		echo "[ERROR] \"sysctl net.ipv4.conf.all.src_valid_mark=1\" is not set. Exiting..."
-		exit 1
-	else
-		echo "[INFO] \"sysctl net.ipv4.conf.all.src_valid_mark=1\" is set."
-		sed -i "s:sysctl -q net.ipv4.conf.all.src_valid_mark=1:echo skipping setting net.ipv4.conf.all.src_valid_mark:" /usr/bin/wg-quick
-	fi
+    if [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" != "1" ]]; then
+        echo "[WRN] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] [--sysctl=\"net.ipv6.conf.all.disable_ipv6=1\"] is not set. Consider disabling ipv6."
+        echo "Add: --sysctl=\"net.ipv6.conf.all.disable_ipv6=1\""
+    fi
 
-	if [[ ! -f "${CONFIG_DIR}/wireguard/${VPN_CONF}.conf" ]]; then
-		mkdir -p "${CONFIG_DIR}/wireguard"
-		chown hotio:hotio "${CONFIG_DIR}/wireguard"
-		echo "[ERROR] Configuration file \"${CONFIG_DIR}/wireguard/${VPN_CONF}.conf\" was not found. Exiting..."
-		exit 1
-	else
-		echo "[INFO] Configuration file \"${CONFIG_DIR}/wireguard/${VPN_CONF}.conf\" was found."
-		chown hotio:hotio "${CONFIG_DIR}/wireguard/${VPN_CONF}.conf"
-		chmod 600 "${CONFIG_DIR}/wireguard/${VPN_CONF}.conf"
-	fi
+    if ip a show docker0 up > /dev/null 2>&1; then
+        echo "[ERR] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Docker network type [host] is not supported with VPN enabled. Exiting..."
+        echo "Use: bridge (preferably custom)"
+        exit 1
+    fi
 
-	if wg-quick down "${CONFIG_DIR}/wireguard/${VPN_CONF}.conf" > /dev/null 2>&1; then
-		echo "[INFO] WireGuard is still running. Stopping WireGuard..."
-		sleep 1
-	else
-		echo "[INFO] WireGuard is down. Continuing..."
-	fi
-	echo "[INFO] Starting WireGuard..."
-	if wg-quick up "${CONFIG_DIR}/wireguard/${VPN_CONF}.conf"; then
-		echo "[INFO] WireGuard is started."
-	else
-		echo "[ERROR] WireGuard failed to start."
-		exit 1
-	fi
+    [[ -f "${CONFIG_DIR}/wireguard/${VPN_CONF}-pre.sh" ]] && bash "${CONFIG_DIR}/wireguard/${VPN_CONF}-pre.sh"
 
-	while true; do
-		if ip a show "${VPN_CONF}" up > /dev/null 2>&1; then
-			break
-		else
-			echo "[INFO] Waiting for \"${VPN_CONF}\" interface to come online."
-			sleep 1
-		fi
-	done
+    if [[ ! -f "${CONFIG_DIR}/wireguard/${VPN_CONF}.conf" ]]; then
+        echo "[ERR] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Configuration file [${CONFIG_DIR}/wireguard/${VPN_CONF}.conf] was not found. Exiting..."
+        exit 1
+    else
+        find "${CONFIG_DIR}/wireguard/${VPN_CONF}.conf" -maxdepth 0 \( ! -user hotio -or ! -group hotio \) -exec chown hotio:hotio {} +
+        chmod 600 "${CONFIG_DIR}/wireguard/${VPN_CONF}.conf"
+        dos2unix -q -n "${CONFIG_DIR}/wireguard/${VPN_CONF}.conf" "/dev/shm/${VPN_CONF}.conf"
+        if [[ "${VPN_CONF}" == *"-fix" ]]; then
+            sed -i 's#0.0.0.0/0#0.0.0.0/1,128.0.0.0/1#g' "/dev/shm/${VPN_CONF}.conf" # Synology Fix
+        fi
+        if [[ "${UNBOUND_ENABLED}" == "true" ]]; then
+            echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] DNS servers from [${VPN_CONF}] will be ignored in favor of Unbound."
+            sed -i 's#DNS.*##g' "/dev/shm/${VPN_CONF}.conf"
+        fi
+    fi
 
-	set -e
+    if [[ "${VPN_FIREWALL_TYPE}" == "legacy" ]] || ( ! grep -q nf_tables < /proc/modules && [[ "${VPN_FIREWALL_TYPE}" != "nftables" ]] ); then
+        echo "[WRN] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Falling back to [iptables], removing package [nftables]..."
+        if grep -q alpine < /etc/os-release; then
+            apk del nftables > /dev/null 2>&1
+        else
+            apt purge -y nftables > /dev/null 2>&1
+        fi
+    fi
 
-	echo "[INFO] WebUI ports are \"${WEBUI_PORTS}\"."
-	echo "[INFO] Additional ports are \"${VPN_ADDITIONAL_PORTS}\"."
-	if [[ -z ${VPN_ADDITIONAL_PORTS} ]]; then
-		VPN_ADDITIONAL_PORTS="${WEBUI_PORTS}"
-	else
-		VPN_ADDITIONAL_PORTS+=",${WEBUI_PORTS}"
-	fi
+    if wg-quick down "/dev/shm/${VPN_CONF}.conf" > /dev/null 2>&1; then
+        echo "[WRN] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] WireGuard is still running. Stopping WireGuard..."
+        sleep 5
+    fi
 
-	if [[ "${PRIVOXY_ENABLED}" == true ]]; then
-		echo "[INFO] Additional privoxy ports are \"8118/tcp,8118/udp\"."
-		VPN_ADDITIONAL_PORTS+=",8118/tcp,8118/udp"
-	fi
+    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Starting WireGuard..."
+    if wg-quick up "/dev/shm/${VPN_CONF}.conf"; then
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] WireGuard is started."
+    else
+        echo "[ERR] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] WireGuard failed to start!"
+        exit 1
+    fi
 
-	vpn_remote=$(grep -P -o -m 1 '(?<=^Endpoint)(\s{0,})[^\n\r]+' < "${CONFIG_DIR}/wireguard/${VPN_CONF}.conf"| sed -e 's~^[=\ ]*~~')
-	vpn_port=$(echo "${vpn_remote}" | grep -P -o -m 1 '(?<=:)\d{2,5}(?=:)?+')
-	echo "[INFO] WireGuard remote is \"${vpn_remote}\"."
+    while true; do
+        if ip a show "${VPN_CONF}" up > /dev/null 2>&1; then
+            break
+        else
+            echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Waiting for [${VPN_CONF}] interface to come online."
+            sleep 5
+        fi
+    done
 
-	nw_interface=$(ip -o -4 route show to default | awk '{print $5}')
-	echo "[INFO] Docker network interface is \"${nw_interface}\"."
+    if [[ "${VPN_KEEP_LOCAL_DNS}" == "true" ]] && [[ "${UNBOUND_ENABLED}" != "true" ]] && [[ -f /etc/resolv.conf.bak ]]; then
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Restoring docker DNS server to resolv.conf."
+        cat /etc/resolv.conf.bak >> "/etc/resolv.conf"
+    else
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] No modifications will be done to resolv.conf."
+    fi
+    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] resolv.conf is:"
+    cat "/etc/resolv.conf"
 
-	nw_ip=$(ip -f inet addr show "${nw_interface}" | grep 'inet' | awk '{print $2}')
-	echo "[INFO] Docker network IP is \"${nw_ip}\"."
+    set -e
 
-	nw_cidr=$(ip -o -f inet addr show "${nw_interface}" | awk '/scope global/ {print $4}')
-	nw_cidr=$(ipcalc "${nw_cidr}" | grep -P -o -m 1 "(?<=Network:)\s+[^\s]+" | sed -e 's~^[ \t]*~~;s~[ \t]*$~~')
-	echo "[INFO] Docker network CIDR is \"${nw_cidr}\"."
+    vpn_endpoint=$(wg show | grep endpoint: | awk '{print $2}')
+    if [[ -z ${vpn_endpoint} ]]; then
+        echo "[ERR] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] WireGuard [${VPN_CONF}] endpoint not found!"
+        exit 1
+    fi
+    vpn_endpoint_ip="${vpn_endpoint%:*}"
+    vpn_endpoint_port="${vpn_endpoint##*:}"
+    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] WireGuard [${VPN_CONF}] endpoint [${vpn_endpoint_ip}][${vpn_endpoint_port}]."
 
-	gateway=$(ip -o -4 route show to default | awk '{print $3}')
+    vpn_allowedips=$(wg show | grep 'allowed ips:' | awk -F ': ' '{print $2}')
+    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] WireGuard [${VPN_CONF}] allowed ips [${vpn_allowedips// /}]."
 
-	IFS=',' read -ra lan_networks <<< "${VPN_LAN_NETWORK}"
-	for lan_network in "${lan_networks[@]}"; do
-		echo "[INFO] Adding \"${lan_network}\" as route via interface \"${nw_interface}\"."
-		ip route add "${lan_network}" via "${gateway}" dev "${nw_interface}"
-	done
+    nw_default=$(ip -o -4 route show to default)
+    nw_interface=$(awk '{print $5}' <<< "${nw_default}")
+    nw_gateway=$(awk '{print $3}' <<< "${nw_default}")
+    networks="$(ip -o -4 route show proto kernel | grep -v "${VPN_CONF}")"
+    while IFS= read -r network; do
+        default_note="         "
+        [[ "$(awk '{print $3}' <<< "${network}")" == "${nw_interface}" ]] && default_ip=$(awk '{print $7}' <<< "${network}") && default_note="[default]"
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Network ${default_note}[$(awk '{print $3}' <<< "${network}")][$(awk '{print $7}' <<< "${network}")][$(awk '{print $1}' <<< "${network}")]."
+    done <<< "${networks}"
 
-	echo "[INFO] ip route overview:"
-	ip route
+    IFS=',' read -ra lan_networks <<< "${VPN_LAN_NETWORK%,}"
+    for lan_network in "${lan_networks[@]}"; do
+        ip route add "${lan_network}" via "${nw_gateway}" dev "${nw_interface}"
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Added [${lan_network}][LAN] as route via interface [${nw_interface}]."
+    done
 
-	echo "[INFO] Configuring iptables..."
-	iptables -P FORWARD DROP
+    if [[ "${VPN_CONF}" == *"-fix" ]]; then
+        ip route add "${vpn_endpoint_ip}" via "${nw_gateway}" dev "${nw_interface}"
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Added [${vpn_endpoint_ip}][${VPN_CONF}] as route via interface [${nw_interface}]."
+    fi
 
-	iptables -P INPUT DROP
-	iptables -A INPUT -i "${VPN_CONF}" -p udp -j ACCEPT
-	iptables -A INPUT -i "${VPN_CONF}" -p tcp -j ACCEPT
-	if [ ! -z "${nw_cidr}" ]; then
-	  iptables -A INPUT -s "${nw_cidr}" -d "${nw_cidr}" -j ACCEPT
-	fi
-	iptables -A INPUT -i "${nw_interface}" -p udp --sport "${vpn_port}" -j ACCEPT
-	iptables -A INPUT -p icmp --icmp-type echo-reply -j ACCEPT
-	iptables -A INPUT -i lo -j ACCEPT
-	IFS=',' read -ra additional_ports <<< "${VPN_ADDITIONAL_PORTS}"
-	for additional_port in "${additional_ports[@]}"; do
-		iptables -A INPUT -i "${nw_interface}" -p "${additional_port##*/}" --dport "${additional_port%/*}" -j ACCEPT
-		iptables -I INPUT -i "${VPN_CONF}" -p "${additional_port##*/}" --dport "${additional_port%/*}" -j DROP
-	done
+    if [[ "${PRIVOXY_ENABLED}" == true ]]; then
+        PRIVOXY_PORT=$(grep 'listen-address' "${CONFIG_DIR}/privoxy/privoxy.conf" | sed 's/^.*://')
+        PRIVOXY_PORTS="${PRIVOXY_PORT}/tcp,${PRIVOXY_PORT}/udp"
+    fi
 
-	iptables -P OUTPUT DROP
-	iptables -A OUTPUT -o "${VPN_CONF}" -p udp -j ACCEPT
-	iptables -A OUTPUT -o "${VPN_CONF}" -p tcp -j ACCEPT
-	if [ ! -z "${nw_cidr}" ]; then
-	  iptables -A OUTPUT -s "${nw_cidr}" -d "${nw_cidr}" -j ACCEPT
-	fi
-	iptables -A OUTPUT -o "${nw_interface}" -p udp --dport "${vpn_port}" -j ACCEPT
-	iptables -A OUTPUT -p icmp --icmp-type echo-request -j ACCEPT
-	iptables -A OUTPUT -o lo -j ACCEPT
-	IFS=',' read -ra additional_ports <<< "${VPN_ADDITIONAL_PORTS}"
-	for additional_port in "${additional_ports[@]}"; do
-		iptables -A OUTPUT -o "${nw_interface}" -p "${additional_port##*/}" --sport "${additional_port%/*}" -j ACCEPT
-		iptables -I OUTPUT -o "${VPN_CONF}" -p "${additional_port##*/}" --sport "${additional_port%/*}" -j DROP
-	done
+    IFS=',' read -ra ports <<< "${WEBUI_PORTS%,}"
+    for port in "${ports[@]}"; do
+        open_ports+="${port},"
+    done
+    IFS=',' read -ra ports <<< "${VPN_EXPOSE_PORTS_ON_LAN%,}"
+    for port in "${ports[@]}"; do
+        open_ports+="${port},"
+    done
+    IFS=',' read -ra ports <<< "${VPN_ADDITIONAL_PORTS%,}"
+    for port in "${ports[@]}"; do
+        open_ports+="${port},"
+    done
+    IFS=',' read -ra ports <<< "${PRIVOXY_PORTS%,}"
+    for port in "${ports[@]}"; do
+        open_ports+="${port},"
+    done
+    IFS=',' read -ra ports <<< "${open_ports%,}"
+    for port in "${ports[@]}"; do
+        grep -q "${port}" <<< "${VPN_AUTO_PORT_FORWARD_TO_PORTS}" && continue
+        closed_ports+="${port},"
+    done
+    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Ports opened on [${nw_interface}] are [${open_ports%,}]."
+    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Ports closed on [${VPN_CONF}] are [${closed_ports%,}]."
+    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Ports redirected on [${VPN_CONF}] are [${VPN_AUTO_PORT_FORWARD_TO_PORTS%,}]."
 
+    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Routes overview:"
+    ip route
 
-	echo "[INFO] iptables overview:"
-	iptables -S
+    unset ipv6_wanted
+    for file in /proc/sys/net/ipv6/conf/*; do
+        [[ "$(cat "/proc/sys/net/ipv6/conf/${file##*/}/disable_ipv6")" == "0" ]] && ipv6_wanted="true"
+    done
+
+    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Added firewall rules:"
+    if ! type nft > /dev/null 2>&1; then
+        # Defaults
+        iptables -P FORWARD DROP
+        iptables -P INPUT DROP
+        iptables -P OUTPUT DROP
+
+        # INPUT
+        IFS=',' read -ra additional_ports <<< "${open_ports%,}"
+        for additional_port in "${additional_ports[@]}"; do
+            iptables -A INPUT -i "${nw_interface}" -p "${additional_port##*/}" --dport "${additional_port%/*}" -d "${default_ip}" -j ACCEPT
+            grep -q "${additional_port}" <<< "${VPN_AUTO_PORT_FORWARD_TO_PORTS}" && continue
+            iptables -I INPUT -i "${VPN_CONF}" -p "${additional_port##*/}" --dport "${additional_port%/*}" -j DROP
+        done
+        while IFS= read -r network; do
+            nw_if=$(awk '{print $3}' <<< "${network}")
+            nw_cidr=$(awk '{print $1}' <<< "${network}")
+            nw_ip=$(awk '{print $7}' <<< "${network}")
+            iptables -A INPUT -i "${nw_if}" -s "${nw_cidr}" -d "${nw_ip}" -j ACCEPT
+        done <<< "${networks}"
+        if [[ ${VPN_LAN_LEAK_ENABLED} == "true" ]]; then
+            IFS=',' read -ra lan_networks <<< "${VPN_LAN_NETWORK%,}"
+            for lan_network in "${lan_networks[@]}"; do
+                iptables -A INPUT -i "${nw_interface}" -s "${lan_network}" -d "${default_ip}" -j ACCEPT
+            done
+        fi
+        iptables -A INPUT -i "${VPN_CONF}" -j ACCEPT
+        iptables -A INPUT -i lo -j ACCEPT
+        iptables -A INPUT -p icmp --icmp-type echo-reply -j ACCEPT
+        ipcalc -4 -c "${vpn_endpoint_ip}" && iptables -A INPUT -i "${nw_interface}" -p udp --sport "${vpn_endpoint_port}" -d "${default_ip}" -s "${vpn_endpoint_ip}" -j ACCEPT
+
+        # OUTPUT
+        IFS=',' read -ra additional_ports <<< "${open_ports%,}"
+        for additional_port in "${additional_ports[@]}"; do
+            iptables -A OUTPUT -o "${nw_interface}" -p "${additional_port##*/}" --sport "${additional_port%/*}" -s "${default_ip}" -j ACCEPT
+            grep -q "${additional_port}" <<< "${VPN_AUTO_PORT_FORWARD_TO_PORTS}" && continue
+            iptables -I OUTPUT -o "${VPN_CONF}" -p "${additional_port##*/}" --sport "${additional_port%/*}" -j DROP
+        done
+        while IFS= read -r network; do
+            nw_if=$(awk '{print $3}' <<< "${network}")
+            nw_cidr=$(awk '{print $1}' <<< "${network}")
+            nw_ip=$(awk '{print $7}' <<< "${network}")
+            iptables -A OUTPUT -o "${nw_if}" -s "${nw_ip}" -d "${nw_cidr}" -j ACCEPT
+        done <<< "${networks}"
+        if [[ ${VPN_LAN_LEAK_ENABLED} == "true" ]]; then
+            IFS=',' read -ra lan_networks <<< "${VPN_LAN_NETWORK%,}"
+            for lan_network in "${lan_networks[@]}"; do
+                iptables -A OUTPUT -o "${nw_interface}" -s "${default_ip}" -d "${lan_network}" -j ACCEPT
+            done
+        fi
+        iptables -A OUTPUT -o "${VPN_CONF}" -j ACCEPT
+        iptables -A OUTPUT -o lo -j ACCEPT
+        iptables -A OUTPUT -p icmp --icmp-type echo-request -j ACCEPT
+        ipcalc -4 -c "${vpn_endpoint_ip}" && iptables -A OUTPUT -o "${nw_interface}" -p udp --dport "${vpn_endpoint_port}" -s "${default_ip}" -d "${vpn_endpoint_ip}" -j ACCEPT
+
+        # Show result
+        iptables -S
+
+        if [[ ${ipv6_wanted} == "true" ]]; then
+            # Defaults
+            ip6tables -P FORWARD DROP
+            ip6tables -P INPUT DROP
+            ip6tables -P OUTPUT DROP
+
+            # INPUT
+            IFS=',' read -ra additional_ports <<< "${open_ports%,}"
+            for additional_port in "${additional_ports[@]}"; do
+                grep -q "${additional_port}" <<< "${VPN_AUTO_PORT_FORWARD_TO_PORTS}" && continue
+                ip6tables -I INPUT -i "${VPN_CONF}" -p "${additional_port##*/}" --dport "${additional_port%/*}" -j DROP
+            done
+            ip6tables -A INPUT -i "${VPN_CONF}" -j ACCEPT
+            ip6tables -A INPUT -p ipv6-icmp --icmpv6-type echo-reply -j ACCEPT
+
+            # OUTPUT
+            IFS=',' read -ra additional_ports <<< "${open_ports%,}"
+            for additional_port in "${additional_ports[@]}"; do
+                grep -q "${additional_port}" <<< "${VPN_AUTO_PORT_FORWARD_TO_PORTS}" && continue
+                ip6tables -I OUTPUT -o "${VPN_CONF}" -p "${additional_port##*/}" --sport "${additional_port%/*}" -j DROP
+            done
+            ip6tables -A OUTPUT -o "${VPN_CONF}" -j ACCEPT
+            ip6tables -A OUTPUT -p ipv6-icmp --icmpv6-type echo-request -j ACCEPT
+
+            # Show result
+            ip6tables -S
+        fi
+    else
+        # Create chains
+        nft add table inet hotio
+        nft add chain inet hotio forward    '{ type filter hook forward    priority 0 ; policy drop; }'
+        nft add chain inet hotio input      '{ type filter hook input      priority 0 ; policy drop; }'
+        nft add chain inet hotio output     '{ type filter hook output     priority 0 ; policy drop; }'
+        nft add chain inet hotio prerouting '{ type nat    hook prerouting priority -100 ; }'
+
+        # Create input rules
+        IFS=',' read -ra additional_ports <<< "${open_ports%,}"
+        for additional_port in "${additional_ports[@]}"; do
+            nft add rule inet hotio input iifname "${nw_interface}" "${additional_port##*/}" dport "${additional_port%/*}" ip daddr "${default_ip}" counter accept
+            grep -q "${additional_port}" <<< "${VPN_AUTO_PORT_FORWARD_TO_PORTS}" && continue
+            nft add rule inet hotio input iifname "${VPN_CONF}" "${additional_port##*/}" dport "${additional_port%/*}" counter drop
+        done
+        while IFS= read -r network; do
+            nw_if=$(awk '{print $3}' <<< "${network}")
+            nw_cidr=$(awk '{print $1}' <<< "${network}")
+            nw_ip=$(awk '{print $7}' <<< "${network}")
+            nft add rule inet hotio input iifname "${nw_if}" ip saddr "${nw_cidr}" ip daddr "${nw_ip}" counter accept
+        done <<< "${networks}"
+        if [[ ${VPN_LAN_LEAK_ENABLED} == "true" ]]; then
+            IFS=',' read -ra lan_networks <<< "${VPN_LAN_NETWORK%,}"
+            for lan_network in "${lan_networks[@]}"; do
+                nft add rule inet hotio input iifname "${nw_interface}" ip saddr "${lan_network}" ip daddr "${default_ip}" counter accept
+            done
+        fi
+        nft add rule inet hotio input iifname "${VPN_CONF}" counter accept
+        nft add rule inet hotio input iifname "lo" counter accept
+        nft add rule inet hotio input icmp type echo-reply counter accept
+        nft add rule inet hotio input icmpv6 type echo-reply counter accept
+        ipcalc -4 -c "${vpn_endpoint_ip}" && nft add rule inet hotio input iifname "${nw_interface}" ip daddr "${default_ip}" ip saddr "${vpn_endpoint_ip}" udp sport "${vpn_endpoint_port}" counter accept
+
+        # Create output rules
+        IFS=',' read -ra additional_ports <<< "${open_ports%,}"
+        for additional_port in "${additional_ports[@]}"; do
+            nft add rule inet hotio output oifname "${nw_interface}" "${additional_port##*/}" sport "${additional_port%/*}" ip saddr "${default_ip}" counter accept
+            grep -q "${additional_port}" <<< "${VPN_AUTO_PORT_FORWARD_TO_PORTS}" && continue
+            nft add rule inet hotio output oifname "${VPN_CONF}" "${additional_port##*/}" sport "${additional_port%/*}" counter drop
+        done
+        while IFS= read -r network; do
+            nw_if=$(awk '{print $3}' <<< "${network}")
+            nw_cidr=$(awk '{print $1}' <<< "${network}")
+            nw_ip=$(awk '{print $7}' <<< "${network}")
+            nft add rule inet hotio output oifname "${nw_if}" ip saddr "${nw_ip}" ip daddr "${nw_cidr}" counter accept
+        done <<< "${networks}"
+        if [[ ${VPN_LAN_LEAK_ENABLED} == "true" ]]; then
+            IFS=',' read -ra lan_networks <<< "${VPN_LAN_NETWORK%,}"
+            for lan_network in "${lan_networks[@]}"; do
+                nft add rule inet hotio output oifname "${nw_interface}" ip saddr "${default_ip}" ip daddr "${lan_network}" counter accept
+            done
+        fi
+        nft add rule inet hotio output oifname "${VPN_CONF}" counter accept
+        nft add rule inet hotio output oifname "lo" counter accept
+        nft add rule inet hotio output icmp type echo-request counter accept
+        nft add rule inet hotio output icmpv6 type echo-request counter accept
+        ipcalc -4 -c "${vpn_endpoint_ip}" && nft add rule inet hotio output oifname "${nw_interface}" ip saddr "${default_ip}" ip daddr "${vpn_endpoint_ip}" udp dport "${vpn_endpoint_port}" counter accept
+
+        # List rules
+        nft -s list table inet hotio
+    fi
+
+    set +e
+
+    [[ -f "${CONFIG_DIR}/wireguard/${VPN_CONF}-post.sh" ]] && bash "${CONFIG_DIR}/wireguard/${VPN_CONF}-post.sh"
+
+    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] Performing internet connectivity test..."
+    echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] [IPV4] [PING: $(ping -c 5 1.1.1.1 2> /dev/null | tail -1 | awk -F ' = ' '{print $2}')] $(curl -fsL -4 --retry 5 --retry-max-time 60 --max-time 10 wtfismyip.com/json | jq -re '"[\(.YourFuckingLocation)] [\(.YourFuckingISP)] [\(.YourFuckingIPAddress)]"')"
+    if [[ ${ipv6_wanted} == "true" ]]; then
+        echo "[INF] [$(date '+%Y-%m-%d %H:%M:%S')] [VPN] [IPV6] [PING: $(ping6 -c 5 2606:4700:4700::1111 2> /dev/null | tail -1 | awk -F ' = ' '{print $2}')] $(curl -fsL -6 --retry 5 --retry-max-time 60 --max-time 10 wtfismyip.com/json | jq -re '"[\(.YourFuckingLocation)] [\(.YourFuckingISP)] [\(.YourFuckingIPAddress)]"')"
+    fi
 fi
